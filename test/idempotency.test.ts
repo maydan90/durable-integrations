@@ -4,6 +4,7 @@ import {
   IdempotencyKeyReusedError,
   IdempotencyStore,
   ManualClock,
+  withTransaction,
   type Pool,
 } from "../src/index.js";
 import { setupDb, truncateAll } from "./helpers/db.js";
@@ -95,5 +96,70 @@ describe("idempotency keys", () => {
     clock.advance(60_001);
     const r = await store.run("client_a", "key-1", {}, async () => ++calls);
     expect(r).toEqual({ response: 2, replayed: false });
+  });
+});
+
+describe("a handler that runs inside withTransaction", () => {
+  // A local table the handler writes to, standing in for the rows a real
+  // request would create (a booking, an order line) before the response exists.
+  beforeEach(async () => {
+    await pool.query(`create table if not exists test_bookings (id text primary key, idempotency_key text not null)`);
+    await pool.query(`truncate test_bookings`);
+  });
+
+  const bookingRows = async () =>
+    (await pool.query<{ n: number }>(`select count(*)::int as n from test_bookings`)).rows[0]?.n;
+  const keyRows = async () =>
+    (
+      await pool.query<{ n: number }>(
+        `select count(*)::int as n from idempotency_keys where scope = 'client_a' and key = 'key-1'`,
+      )
+    ).rows[0]?.n;
+
+  it("rolls the handler's writes back and frees the key when the handler throws, so the retry starts clean", async () => {
+    let calls = 0;
+    const book = (failAfterWrite: boolean) =>
+      store.run("client_a", "key-1", { party: 2 }, () =>
+        withTransaction(pool, async (tx) => {
+          calls++;
+          await tx.query(`insert into test_bookings (id, idempotency_key) values ($1, $2)`, ["b_1", "key-1"]);
+          if (failAfterWrite) throw new Error("provider down");
+          return { bookingId: "b_1" };
+        }),
+      );
+
+    // The handler wrote a row and then failed: the row is gone with the
+    // transaction, and the key is free, so the client is not stuck behind an
+    // "in progress" claim for a request that produced nothing.
+    await expect(book(true)).rejects.toThrow("provider down");
+    expect(await bookingRows()).toBe(0);
+    expect(await keyRows()).toBe(0);
+
+    // The retry runs the handler again and commits exactly once.
+    expect(await book(false)).toEqual({ response: { bookingId: "b_1" }, replayed: false });
+    expect(await bookingRows()).toBe(1);
+    expect(await keyRows()).toBe(1);
+
+    // A further retry replays the stored response. Had the handler run again,
+    // the primary key on test_bookings would have made it throw.
+    expect(await book(false)).toEqual({ response: { bookingId: "b_1" }, replayed: true });
+    expect(await bookingRows()).toBe(1);
+    expect(calls).toBe(2);
+  });
+
+  it("keeps the handler's writes when it returns, and the stored response with them", async () => {
+    const result = await store.run("client_a", "key-1", { party: 4 }, () =>
+      withTransaction(pool, async (tx) => {
+        await tx.query(`insert into test_bookings (id, idempotency_key) values ($1, $2)`, ["b_2", "key-1"]);
+        return { bookingId: "b_2" };
+      }),
+    );
+    expect(result).toEqual({ response: { bookingId: "b_2" }, replayed: false });
+    expect(await bookingRows()).toBe(1);
+
+    const stored = await pool.query<{ status: string; response: { bookingId: string } }>(
+      `select status, response from idempotency_keys where scope = 'client_a' and key = 'key-1'`,
+    );
+    expect(stored.rows[0]).toEqual({ status: "completed", response: { bookingId: "b_2" } });
   });
 });
