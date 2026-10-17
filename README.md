@@ -44,6 +44,24 @@ const { response, replayed } = await store.run(clientId, idempotencyKey, request
 - Keys are scoped per caller. One client's key cannot replay or collide with another's.
 - A handler that throws frees the key so the client can retry. If the handler itself wrote to a third party, that write belongs in an operation (below), not behind the key.
 
+### The handler inside a transaction
+
+A request usually writes local rows before it has a response to store: the booking, the order lines, the audit entry. Run the handler inside `withTransaction` so those rows and the response stand or fall together:
+
+```ts
+const { response } = await store.run(clientId, idempotencyKey, requestBody, () =>
+  withTransaction(pool, async (tx) => {
+    const booking = await insertBooking(tx, requestBody);
+    await enqueueProviderWrite(tx, booking); // a provider_operations row, see below
+    return { bookingId: booking.id };
+  }),
+);
+```
+
+If the handler throws, the transaction rolls back and the store frees the key, so the retry starts from nothing: no half-written booking, no "in progress" refusal for a request that produced nothing. `test/idempotency.test.ts` proves both halves.
+
+Two things are deliberately outside the transaction. The claim is committed before the handler starts, because it has to be visible to a concurrent retry on another connection. The `completed` write happens after the commit. A crash between the two leaves the key `in_progress` until its TTL, which is the conservative failure: the client is told to wait, never handed a duplicate.
+
 ## Leased operations and unknown-outcome recovery
 
 ```ts
