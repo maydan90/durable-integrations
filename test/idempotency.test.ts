@@ -99,6 +99,62 @@ describe("idempotency keys", () => {
   });
 });
 
+describe("HTTP responses keep their status code", () => {
+  it("replays a 201 Created as 201 with the same body, without running the handler again", async () => {
+    let calls = 0;
+    const create = () =>
+      store.runHttp("client_a", "key-1", { party: 2 }, async () => ({
+        status: 201,
+        body: { bookingId: `b_${++calls}` },
+      }));
+
+    expect(await create()).toEqual({ status: 201, body: { bookingId: "b_1" }, replayed: false });
+    expect(await create()).toEqual({ status: 201, body: { bookingId: "b_1" }, replayed: true });
+    expect(calls).toBe(1);
+  });
+
+  it("replays a returned 422 as 422: a validation error the handler answered with is a real response", async () => {
+    let calls = 0;
+    const handler = async () => {
+      calls++;
+      return { status: 422, body: { error: "party_too_large", max: 12 } };
+    };
+
+    await store.runHttp("client_a", "key-1", { party: 40 }, handler);
+    const retry = await store.runHttp("client_a", "key-1", { party: 40 }, handler);
+
+    expect(retry).toEqual({ status: 422, body: { error: "party_too_large", max: 12 }, replayed: true });
+    expect(calls).toBe(1);
+  });
+
+  it("stores the status next to the response, and none for keys stored through run()", async () => {
+    await store.runHttp("client_a", "key-1", {}, async () => ({ status: 202, body: { queued: true } }));
+    await store.run("client_a", "key-2", {}, async () => ({ queued: true }));
+
+    const rows = await pool.query<{ key: string; response_status: number | null }>(
+      `select key, response_status from idempotency_keys where scope = 'client_a' order by key`,
+    );
+    expect(rows.rows).toEqual([
+      { key: "key-1", response_status: 202 },
+      { key: "key-2", response_status: null },
+    ]);
+
+    // A key first stored without a status replays as 200 through runHttp.
+    const replay = await store.runHttp("client_a", "key-2", {}, async () => ({ status: 500, body: null }));
+    expect(replay).toEqual({ status: 200, body: { queued: true }, replayed: true });
+  });
+
+  it("still frees the key when the handler throws, so a retry can produce a status at all", async () => {
+    await expect(
+      store.runHttp("client_a", "key-1", {}, async () => {
+        throw new Error("downstream down");
+      }),
+    ).rejects.toThrow("downstream down");
+    const retry = await store.runHttp("client_a", "key-1", {}, async () => ({ status: 201, body: "created" }));
+    expect(retry).toEqual({ status: 201, body: "created", replayed: false });
+  });
+});
+
 describe("a handler that runs inside withTransaction", () => {
   // A local table the handler writes to, standing in for the rows a real
   // request would create (a booking, an order line) before the response exists.
