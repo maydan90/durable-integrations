@@ -44,6 +44,17 @@ const { response, replayed } = await store.run(clientId, idempotencyKey, request
 - Keys are scoped per caller. One client's key cannot replay or collide with another's.
 - A handler that throws frees the key so the client can retry. If the handler itself wrote to a third party, that write belongs in an operation (below), not behind the key.
 
+For an HTTP endpoint, `runHttp` stores the status code next to the body, so a retried `POST` that first returned `201 Created` gets `201` again, not a `200` with the same body:
+
+```ts
+const { status, body, replayed } = await store.runHttp(clientId, idempotencyKey, requestBody, async () => {
+  const booking = await createBooking(requestBody);
+  return { status: 201, body: booking };
+});
+```
+
+A response the handler *returns*, such as a `422` for invalid input, is a real answer and replays with its status. Only a handler that *throws* frees the key.
+
 ### The handler inside a transaction
 
 A request usually writes local rows before it has a response to store: the booking, the order lines, the audit entry. Run the handler inside `withTransaction` so those rows and the response stand or fall together:
