@@ -36,6 +36,17 @@ export interface IdempotentResult<T> {
   replayed: boolean;
 }
 
+/** What an HTTP handler produces: the status code matters as much as the body. */
+export interface HttpResponse<B> {
+  status: number;
+  body: B;
+}
+
+export interface IdempotentHttpResult<B> extends HttpResponse<B> {
+  /** true when the status and body came from the ledger and the handler did not run */
+  replayed: boolean;
+}
+
 export interface IdempotencyOptions {
   clock: Clock;
   /** how long a completed key keeps its stored response; default 24h */
@@ -72,6 +83,38 @@ export class IdempotencyStore {
    * either replay it or are told it is in progress.
    */
   async run<T>(scope: string, key: string, request: unknown, handler: () => Promise<T>): Promise<IdempotentResult<T>> {
+    const r = await this.execute(scope, key, request, async () => ({ value: await handler(), status: null }));
+    return { response: r.value, replayed: r.replayed };
+  }
+
+  /**
+   * Like `run`, for an HTTP endpoint: the status code is stored with the body,
+   * so a retry of a request that returned 201 Created gets 201 again, not a
+   * 200 with the same body. A response the handler *returns* (a 422 for a
+   * validation error, say) is a real answer and is replayed with its status;
+   * only a handler that *throws* frees the key.
+   *
+   * A key first stored through `run` has no status and replays as 200.
+   */
+  async runHttp<B>(
+    scope: string,
+    key: string,
+    request: unknown,
+    handler: () => Promise<HttpResponse<B>>,
+  ): Promise<IdempotentHttpResult<B>> {
+    const r = await this.execute(scope, key, request, async () => {
+      const res = await handler();
+      return { value: res.body, status: res.status };
+    });
+    return { status: r.status ?? 200, body: r.value, replayed: r.replayed };
+  }
+
+  private async execute<T>(
+    scope: string,
+    key: string,
+    request: unknown,
+    handler: () => Promise<{ value: T; status: number | null }>,
+  ): Promise<{ value: T; status: number | null; replayed: boolean }> {
     const hash = requestDigest(request);
     const now = this.opts.clock.now();
     const expiresAt = new Date(now.getTime() + this.ttlMs);
@@ -92,23 +135,28 @@ export class IdempotencyStore {
     );
 
     if (claimed.rowCount === 0) {
-      const existing = await this.pool.query<{ request_hash: string; status: string; response: T }>(
-        `select request_hash, status, response from idempotency_keys where scope = $1 and key = $2`,
+      const existing = await this.pool.query<{
+        request_hash: string;
+        status: string;
+        response: T;
+        response_status: number | null;
+      }>(
+        `select request_hash, status, response, response_status from idempotency_keys where scope = $1 and key = $2`,
         [scope, key],
       );
       const row = existing.rows[0];
       if (!row) {
         // The row vanished between our insert and select (a failed handler freed it). Try again.
-        return this.run(scope, key, request, handler);
+        return this.execute(scope, key, request, handler);
       }
       if (row.request_hash !== hash) throw new IdempotencyKeyReusedError(scope, key);
       if (row.status !== "completed") throw new IdempotencyInProgressError(scope, key);
-      return { response: row.response, replayed: true };
+      return { value: row.response, status: row.response_status, replayed: true };
     }
 
-    let response: T;
+    let result: { value: T; status: number | null };
     try {
-      response = await handler();
+      result = await handler();
     } catch (err) {
       // A handler that threw did not produce a response worth replaying: free the
       // key so the client can retry. (If the handler itself wrote to a third
@@ -118,9 +166,10 @@ export class IdempotencyStore {
     }
 
     await this.pool.query(
-      `update idempotency_keys set status = 'completed', response = $3 where scope = $1 and key = $2`,
-      [scope, key, JSON.stringify(response)],
+      `update idempotency_keys set status = 'completed', response = $3, response_status = $4
+       where scope = $1 and key = $2`,
+      [scope, key, JSON.stringify(result.value), result.status],
     );
-    return { response, replayed: false };
+    return { value: result.value, status: result.status, replayed: false };
   }
 }

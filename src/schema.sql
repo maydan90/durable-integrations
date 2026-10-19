@@ -8,10 +8,16 @@ create table if not exists idempotency_keys (
   request_hash  text        not null,
   status        text        not null check (status in ('in_progress', 'completed')),
   response      jsonb,
+  response_status int,
   created_at    timestamptz not null,
   expires_at    timestamptz not null,
   primary key (scope, key)
 );
+
+--    response_status is the HTTP status of the first response (null for keys
+--    stored through run(), which has no status). Added after the first release,
+--    so existing databases get it here; migrate() stays safe to run twice.
+alter table idempotency_keys add column if not exists response_status int;
 
 -- 2. Provider operations: a ledger of writes to a third party. The request_id
 --    is generated once and sent on every attempt so the provider can dedupe.

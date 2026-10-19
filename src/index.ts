@@ -8,7 +8,7 @@ export {
   IdempotencyInProgressError,
   requestDigest,
 } from "./idempotency.js";
-export type { IdempotentResult, IdempotencyOptions } from "./idempotency.js";
+export type { IdempotentResult, IdempotentHttpResult, HttpResponse, IdempotencyOptions } from "./idempotency.js";
 export { OperationStore, StaleLeaseError } from "./operations.js";
 export type { Operation, OperationState, OperationsOptions } from "./operations.js";
 export { LostAnswerError, ScriptedProvider } from "./provider.js";
