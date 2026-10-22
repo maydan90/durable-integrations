@@ -102,7 +102,8 @@ const COLUMNS =
   "id, kind, request_id, payload, state, attempts, max_attempts, lease_owner, lease_until, next_attempt_at, result, last_error";
 
 export class OperationStore {
-  private readonly leaseMs: number;
+  /** Exposed so a worker loop can pick a renewal interval (see worker.ts). */
+  readonly leaseMs: number;
   private readonly maxAttempts: number;
   private readonly backoff: { baseMs: number; maxMs: number; random?: () => number };
 
