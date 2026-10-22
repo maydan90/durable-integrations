@@ -9,7 +9,7 @@ This repo demonstrates four mechanisms I reach for whenever a system has to call
 3. **Unknown-outcome recovery** (`src/operations.ts`): a timeout is recorded as *unknown*, not failed. The next attempt asks the provider whether the write applied before sending again, with the same request id. After the attempt budget it becomes *stuck* for a human; nothing is guessed.
 4. **Webhook delivery with replay** (`src/webhooks.ts`): an append-only event ledger, one delivery row per (endpoint, event) so retries cannot fan out twice, HMAC signatures with the timestamp inside the signed message, exponential backoff, auto-disable of dead endpoints, and replay over a time window.
 
-Everything is deliberately small: `pg` and plain SQL, no framework, under 900 lines of source. The tests are the specification.
+Everything is deliberately small: `pg` and plain SQL, no framework, about a thousand lines of source. The tests are the specification.
 
 ```
 npm install
@@ -80,8 +80,13 @@ const ops = new OperationStore(pool, { clock: systemClock, leaseMs: 30_000, maxA
 
 await ops.enqueue("booking.create", { table: 12, party: 4, at });   // intent, recorded first
 
-// in a worker loop, any number of workers:
+// one step of a worker loop; any number of workers may run it:
 await ops.runOne(workerId, provider);
+
+// or the long-running loop in src/worker.ts: claim, execute, renew the lease on a
+// timer while the provider is slow, stop gracefully after the current attempt
+const worker = runWorker(ops, provider, { owner: workerId });
+process.on("SIGTERM", () => void worker.stop());
 ```
 
 State machine:
@@ -104,6 +109,8 @@ Rules the tests pin down:
 - **Leases fence writes.** Claiming sets `lease_owner` and `lease_until`. Every state update is `WHERE lease_owner = $me AND lease_until >= now()`. A worker that stalled past its lease and wakes up later gets `StaleLeaseError` instead of overwriting what the new owner recorded.
 - **Skip, don't block.** `FOR UPDATE SKIP LOCKED` lets eight workers poll one table; the test hands three operations to eight concurrent claimers and checks that each goes to exactly one.
 - **Bounded, honest retries.** Backoff is exponential with jitter. After `maxAttempts` the row is *stuck* and listed by `ops.stuck()`. It is never marked failed, because we do not know that it failed.
+- **A live worker keeps its lease; a dead one loses it.** `runWorker` renews the lease every `leaseMs / 3` while an attempt is in progress, so a slow provider does not get the row handed to a second worker mid-write. A worker that dies simply stops renewing and the row is claimable within one lease period, in recovery mode. The test `without renewal, an attempt slower than the lease cannot record its outcome` shows what the timer prevents.
+- **Stop means finish, then exit.** `worker.stop()` returns after the attempt in progress has been recorded; nothing is abandoned mid-write. `examples/worker.ts` wires this to SIGTERM and SIGINT.
 
 ## Webhook delivery with replay
 
@@ -124,7 +131,7 @@ await hooks.replay(endpointId, since);                                         /
 ## How the tests work
 
 - `@testcontainers/postgresql` starts PostgreSQL 16 for the run; set `DATABASE_URL` to use an existing server instead.
-- Time is injected (`ManualClock`), so lease expiry, backoff and replay windows are tested by moving the clock, never by sleeping.
+- Time is injected (`ManualClock`), so lease expiry, backoff and replay windows are tested by moving the clock, never by sleeping. The one exception is `worker.test.ts`: lease renewal is about real elapsed time while a provider is slow, so those tests use the system clock, a 300 ms lease and a provider that answers after 800 ms.
 - The provider and the HTTP transport are scripted fakes that record every call (`ScriptedProvider`, `ScriptedTransport`). The provider fake can apply a write and then lose the answer, which is the case the recovery logic exists for.
 - Concurrency tests use real concurrent queries against the real database, because `SKIP LOCKED` semantics are the point.
 
@@ -138,16 +145,20 @@ src/
   idempotency.ts   IdempotencyStore
   provider.ts      Provider interface, LostAnswerError, ScriptedProvider
   operations.ts    OperationStore: enqueue, claim, execute, renew, stuck
+  worker.ts        runWorker: the long-running loop with lease renewal and graceful stop
   webhooks.ts      WebhookStore: endpoints, publish, deliverDue, replay; sign/verify
+examples/
+  worker.ts        a worker process: npm run build && DATABASE_URL=... node dist/examples/worker.js
 test/
   idempotency.test.ts
   operations.test.ts
+  worker.test.ts
   webhooks.test.ts
   helpers/         Testcontainers global setup, truncate helper
 ```
 
 ## What this is not
 
-It is a reference implementation, not a library: no HTTP layer, no scheduler, no metrics. In a real service each store sits behind a small module boundary, the worker loop is a cron or a long-running process with lease renewal on a timer, and every transition emits a span. The domain (bookings) is generic and nothing here is taken from an employer's codebase.
+It is a reference implementation, not a library: no HTTP layer, no scheduler, no metrics. In a real service each store sits behind a small module boundary, the worker loop runs as a managed process with a health check, and every transition emits a span. The domain (bookings) is generic and nothing here is taken from an employer's codebase.
 
 MIT licensed. Written by [Yurii Maidaniuk](https://github.com/maydan90).

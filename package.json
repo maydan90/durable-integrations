@@ -7,7 +7,7 @@
   "type": "module",
   "engines": { "node": ">=20" },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && cp src/schema.sql dist/src/schema.sql",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
