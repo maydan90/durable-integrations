@@ -14,6 +14,8 @@ export type { Operation, OperationState, OperationsOptions } from "./operations.
 export { runWorker } from "./worker.js";
 export type { WorkerOptions, WorkerHandle } from "./worker.js";
 export { LostAnswerError, ScriptedProvider } from "./provider.js";
-export type { Provider, ProviderOutcome, ScriptedBehavior } from "./provider.js";
+export type { Provider, ProviderOutcome, ProviderLedger, AppliedWrite, ScriptedBehavior } from "./provider.js";
+export { reconcile } from "./reconcile.js";
+export type { ReconcileReport, ReconcileOptions, ReconcileSource, Finding, HealedOperation } from "./reconcile.js";
 export { WebhookStore, sign, verify, SIGNATURE_HEADER } from "./webhooks.js";
 export type { Endpoint, WebhookEvent, Delivery, DeliveryState, Transport, WebhookOptions } from "./webhooks.js";

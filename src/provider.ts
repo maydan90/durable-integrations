@@ -1,3 +1,5 @@
+import { systemClock, type Clock } from "./clock.js";
+
 /**
  * The shape of a third party we write to. Three things can happen to a write:
  *
@@ -19,6 +21,23 @@ export interface Provider<P = unknown, R = unknown> {
   lookup(requestId: string): Promise<R | null>;
 }
 
+/**
+ * The provider's own record of what it applied, read in time windows. Most
+ * providers worth integrating with expose one: a list endpoint filtered by
+ * date, a settlement file, a daily report. Reconciliation (reconcile.ts)
+ * compares it with our operations.
+ */
+export interface AppliedWrite<R = unknown> {
+  requestId: string;
+  result: R;
+  appliedAt: Date;
+}
+
+export interface ProviderLedger<R = unknown> {
+  /** Writes the provider applied in [since, until). */
+  listApplied(since: Date, until: Date): Promise<AppliedWrite<R>[]>;
+}
+
 export class LostAnswerError extends Error {
   readonly code = "lost_answer";
   constructor(message = "no answer from provider") {
@@ -33,13 +52,19 @@ export class LostAnswerError extends Error {
  */
 export type ScriptedBehavior = "ok" | "refuse" | "lost_before_apply" | "lost_after_apply";
 
-export class ScriptedProvider implements Provider<Record<string, unknown>, { providerRef: string }> {
+export class ScriptedProvider
+  implements Provider<Record<string, unknown>, { providerRef: string }>, ProviderLedger<{ providerRef: string }>
+{
   readonly performCalls: Array<{ kind: string; requestId: string; behavior: ScriptedBehavior }> = [];
   readonly lookupCalls: string[] = [];
-  private readonly applied = new Map<string, { providerRef: string }>();
+  private readonly applied = new Map<string, AppliedWrite<{ providerRef: string }>>();
   private script: ScriptedBehavior[];
 
-  constructor(script: ScriptedBehavior[]) {
+  /** `clock` stamps each applied write, so tests can place writes inside or outside a reconciliation window. */
+  constructor(
+    script: ScriptedBehavior[],
+    private readonly clock: Clock = systemClock,
+  ) {
     this.script = [...script];
   }
 
@@ -48,31 +73,49 @@ export class ScriptedProvider implements Provider<Record<string, unknown>, { pro
     this.performCalls.push({ kind, requestId, behavior });
     // A well-behaved provider dedupes on the caller's request id.
     const already = this.applied.get(requestId);
-    if (already && behavior !== "refuse") return { ok: true as const, result: already };
+    if (already && behavior !== "refuse") return { ok: true as const, result: already.result };
 
     switch (behavior) {
-      case "ok": {
-        const result = { providerRef: `ref_${requestId.slice(0, 8)}` };
-        this.applied.set(requestId, result);
-        return { ok: true as const, result };
-      }
+      case "ok":
+        return { ok: true as const, result: this.apply(requestId) };
       case "refuse":
         return { ok: false as const, refusal: { code: "slot_unavailable", message: "that time is not available" } };
       case "lost_before_apply":
         throw new LostAnswerError("connection reset before the request was sent");
       case "lost_after_apply":
-        this.applied.set(requestId, { providerRef: `ref_${requestId.slice(0, 8)}` });
+        this.apply(requestId);
         throw new LostAnswerError("read timeout after the request was sent");
     }
   }
 
   async lookup(requestId: string) {
     this.lookupCalls.push(requestId);
-    return this.applied.get(requestId) ?? null;
+    return this.applied.get(requestId)?.result ?? null;
+  }
+
+  async listApplied(since: Date, until: Date) {
+    return [...this.applied.values()]
+      .filter((w) => w.appliedAt >= since && w.appliedAt < until)
+      .sort((a, b) => a.appliedAt.getTime() - b.appliedAt.getTime());
+  }
+
+  /**
+   * A write that reached the provider without going through `perform` here:
+   * another system, a retry from an old deploy, someone using the provider's
+   * dashboard. Reconciliation should report it, not adopt it.
+   */
+  applyElsewhere(requestId: string): { providerRef: string } {
+    return this.apply(requestId);
   }
 
   /** What the provider believes it has applied; the test oracle. */
   appliedWrites(): string[] {
     return [...this.applied.keys()];
+  }
+
+  private apply(requestId: string): { providerRef: string } {
+    const result = { providerRef: `ref_${requestId.slice(0, 8)}` };
+    this.applied.set(requestId, { requestId, result, appliedAt: this.clock.now() });
+    return result;
   }
 }

@@ -49,6 +49,12 @@ create index if not exists provider_operations_claimable
   on provider_operations (next_attempt_at)
   where state in ('pending', 'unknown', 'in_flight');
 
+--    Reconciliation reads succeeded rows by the time their success was
+--    recorded (updated_at never moves after that), one window at a time.
+create index if not exists provider_operations_succeeded
+  on provider_operations (updated_at)
+  where state = 'succeeded';
+
 -- 3. Webhooks: an append-only event ledger, endpoints with a signing secret,
 --    and one delivery row per (endpoint, event) so a retry can never fan out twice.
 create table if not exists webhook_endpoints (
