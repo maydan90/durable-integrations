@@ -1,5 +1,9 @@
 # durable-integrations
 
+[![ci](https://github.com/maydan90/durable-integrations/actions/workflows/ci.yml/badge.svg)](https://github.com/maydan90/durable-integrations/actions/workflows/ci.yml)
+
+Status: working reference implementation. Every push runs the 45 tests against PostgreSQL 16 in Docker (idempotency, leased operations, webhooks, the worker loop, reconciliation).
+
 Patterns for writing to third parties whose answers can be lost, in TypeScript on PostgreSQL, tested against a real database.
 
 This repo demonstrates five mechanisms I reach for whenever a system has to call a payment processor, a booking provider, a carrier or any API where a duplicate write costs money and a lost answer is not a failure:
