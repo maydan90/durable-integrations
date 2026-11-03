@@ -101,6 +101,25 @@ function toOperation<P, R>(r: Row): Operation<P, R> {
 const COLUMNS =
   "id, kind, request_id, payload, state, attempts, max_attempts, lease_owner, lease_until, next_attempt_at, result, last_error";
 
+/**
+ * "A worker could claim this row now", with $1 as the current time. claim(),
+ * listDue() and stats() share it, so the dashboard and the workers cannot
+ * disagree about what is due. An in_flight row counts only once its lease has
+ * expired, which is what a crashed worker looks like.
+ */
+const DUE = `state in ('pending', 'unknown', 'in_flight')
+            and next_attempt_at <= $1
+            and (lease_until is null or lease_until < $1)`;
+
+export interface OperationStats {
+  /** Rows per state. Every state is present, zero when there are none. */
+  byState: Record<OperationState, number>;
+  /** Rows a worker could claim right now: what listDue() returns, without the limit. */
+  due: number;
+  /** When the oldest due row became due. Far in the past means the workers are behind or down. */
+  oldestDueAt: Date | null;
+}
+
 export class OperationStore {
   /** Exposed so a worker loop can pick a renewal interval (see worker.ts). */
   readonly leaseMs: number;
@@ -146,9 +165,7 @@ export class OperationStore {
     const res = await this.pool.query<Row>(
       `with candidate as (
          select id, state as prev_state from provider_operations
-          where state in ('pending', 'unknown', 'in_flight')
-            and next_attempt_at <= $1
-            and (lease_until is null or lease_until < $1)
+          where ${DUE}
           order by next_attempt_at
           for update skip locked
           limit 1
@@ -264,6 +281,54 @@ export class OperationStore {
   async stuck(): Promise<Operation[]> {
     const res = await this.pool.query<Row>(`select ${COLUMNS} from provider_operations where state = 'stuck' order by updated_at`);
     return res.rows.map((r) => toOperation(r));
+  }
+
+  /**
+   * The rows a worker would claim next, oldest due first, for a dashboard or
+   * an on-call check. A plain read: no row lock and no lease, so looking never
+   * changes what the workers do, and `recovering` says which rows will start
+   * with a lookup.
+   */
+  async listDue(limit = 50): Promise<Operation[]> {
+    const now = this.opts.clock.now();
+    const res = await this.pool.query<Row>(
+      `select ${COLUMNS}, state as prev_state from provider_operations
+        where ${DUE}
+        order by next_attempt_at
+        limit $2`,
+      [now, limit],
+    );
+    return res.rows.map((r) => toOperation(r));
+  }
+
+  /** Counts per state plus the due backlog, in one query. */
+  async stats(): Promise<OperationStats> {
+    const now = this.opts.clock.now();
+    const res = await this.pool.query<{ state: OperationState; n: string; due: string; oldest_due: Date | null }>(
+      `select state,
+              count(*) as n,
+              count(*) filter (where ${DUE}) as due,
+              min(next_attempt_at) filter (where ${DUE}) as oldest_due
+         from provider_operations
+        group by state`,
+      [now],
+    );
+    const byState: Record<OperationState, number> = {
+      pending: 0,
+      in_flight: 0,
+      succeeded: 0,
+      refused: 0,
+      unknown: 0,
+      stuck: 0,
+    };
+    let due = 0;
+    let oldestDueAt: Date | null = null;
+    for (const r of res.rows) {
+      byState[r.state] = Number(r.n); // count() is bigint, which pg returns as a string
+      due += Number(r.due);
+      if (r.oldest_due && (!oldestDueAt || r.oldest_due < oldestDueAt)) oldestDueAt = r.oldest_due;
+    }
+    return { byState, due, oldestDueAt };
   }
 
   /**
