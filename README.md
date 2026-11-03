@@ -116,6 +116,7 @@ Rules the tests pin down:
 - **Bounded, honest retries.** Backoff is exponential with jitter. After `maxAttempts` the row is *stuck* and listed by `ops.stuck()`. It is never marked failed, because we do not know that it failed.
 - **A live worker keeps its lease; a dead one loses it.** `runWorker` renews the lease every `leaseMs / 3` while an attempt is in progress, so a slow provider does not get the row handed to a second worker mid-write. A worker that dies simply stops renewing and the row is claimable within one lease period, in recovery mode. The test `without renewal, an attempt slower than the lease cannot record its outcome` shows what the timer prevents.
 - **Stop means finish, then exit.** `worker.stop()` returns after the attempt in progress has been recorded; nothing is abandoned mid-write. `examples/worker.ts` wires this to SIGTERM and SIGINT.
+- **The dashboard reads what the workers read.** `ops.stats()` returns a count per state, how many rows are due now and when the oldest one became due (an old timestamp means the workers are behind or down). `ops.listDue(limit)` lists those rows oldest first, with `recovering` set on the ones that will start with a lookup. Both use the same "due" condition as `claim()`, so a row whose worker crashed shows up exactly when another worker could take it, and neither takes a lock or a lease, so looking never changes what the workers do.
 
 ## Reconciliation
 
@@ -169,7 +170,7 @@ src/
   clock.ts         Clock, ManualClock, backoff with jitter
   idempotency.ts   IdempotencyStore
   provider.ts      Provider and ProviderLedger interfaces, LostAnswerError, ScriptedProvider
-  operations.ts    OperationStore: enqueue, claim, execute, renew, stuck
+  operations.ts    OperationStore: enqueue, claim, execute, renew, stuck, listDue, stats
   reconcile.ts     reconcile: heal from the provider's ledger, report the rest
   worker.ts        runWorker: the long-running loop with lease renewal and graceful stop
   webhooks.ts      WebhookStore: endpoints, publish, deliverDue, replay; sign/verify
@@ -178,6 +179,7 @@ examples/
 test/
   idempotency.test.ts
   operations.test.ts
+  dashboard.test.ts
   worker.test.ts
   reconcile.test.ts
   webhooks.test.ts
