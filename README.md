@@ -10,7 +10,7 @@ This repo demonstrates five mechanisms I reach for whenever a system has to call
 
 1. **Idempotency keys** (`src/idempotency.ts`): a retried request gets the stored response, the same key with a different payload is refused, and two concurrent retries cannot both run.
 2. **Leased operations** (`src/operations.ts`): every outbound write is a row first. Workers claim rows under `FOR UPDATE SKIP LOCKED`, hold a lease, and every state write is fenced on still owning it.
-3. **Unknown-outcome recovery** (`src/operations.ts`): a timeout is recorded as *unknown*, not failed. The next attempt asks the provider whether the write applied before sending again, with the same request id. After the attempt budget it becomes *stuck* for a human; nothing is guessed.
+3. **Unknown-outcome recovery** (`src/operations.ts`): a timeout is recorded as *unknown*, not failed. The next attempt asks the provider whether the write applied before sending again, with the same request id. After the attempt budget it becomes *stuck*; reconciliation or a person with `ops.resolve()` settles it, and nothing is guessed.
 4. **Webhook delivery with replay** (`src/webhooks.ts`): an append-only event ledger, one delivery row per (endpoint, event) so retries cannot fan out twice, HMAC signatures with the timestamp inside the signed message, exponential backoff, auto-disable of dead endpoints, and replay over a time window.
 5. **Reconciliation** (`src/reconcile.ts`): compares a window of the provider's own records with the operations table, heals *unknown* and *stuck* operations the provider applied, and reports what a person has to decide: writes we have no row for, refusals the provider applied anyway, and successes the provider has no record of.
 
@@ -138,6 +138,25 @@ Look-before-you-write protects the operation a worker is about to retry. It does
 
 It never resends a write, and it never turns an *unknown* into a refusal: not finding a write in one window is not proof that it did not happen.
 
+### When a person decides
+
+```ts
+await ops.resolve(op.id, {
+  outcome: "applied",            // or "not_applied"
+  result: { providerRef: "bk_7f3a" },
+  by: "yuri",
+  note: "Booking is in the provider dashboard, created 19:02",
+});
+```
+
+Some stuck rows never show up in the provider's ledger in time, or the provider has no ledger at all, so someone checks by hand. `ops.resolve()` records what they found:
+
+- **Only stuck rows.** Pending, in-flight and unknown rows belong to the workers, and finished rows already have their answer. Anything else throws `NotStuckError` with the row's current state and changes nothing.
+- **It loses to reconciliation, visibly.** The update is a compare-and-set on `state = 'stuck'`. If the nightly job healed the row a minute earlier, the person gets `NotStuckError` saying it is now *succeeded*, instead of overwriting the provider's proof with a guess.
+- **An audit trail on the row.** `resolved_by`, `resolved_at` and `resolution_note` are required, and `op.resolution` returns them. "Not applied" is stored as a refusal with code `not_applied` and the note as its message.
+- **A wrong call is caught, not hidden.** If someone marks a write *not applied* and the provider has it, the next reconciliation reports `applied_but_refused` for that row. The test `a wrong 'not_applied' is caught by the next reconciliation` shows it.
+- **It never resends.** If the write is missing and still has to happen, that is a new operation with a new request id, enqueued on purpose.
+
 ## Webhook delivery with replay
 
 ```ts
@@ -170,7 +189,7 @@ src/
   clock.ts         Clock, ManualClock, backoff with jitter
   idempotency.ts   IdempotencyStore
   provider.ts      Provider and ProviderLedger interfaces, LostAnswerError, ScriptedProvider
-  operations.ts    OperationStore: enqueue, claim, execute, renew, stuck, listDue, stats
+  operations.ts    OperationStore: enqueue, claim, execute, renew, stuck, resolve, listDue, stats
   reconcile.ts     reconcile: heal from the provider's ledger, report the rest
   worker.ts        runWorker: the long-running loop with lease renewal and graceful stop
   webhooks.ts      WebhookStore: endpoints, publish, deliverDue, replay; sign/verify
@@ -182,6 +201,7 @@ test/
   dashboard.test.ts
   worker.test.ts
   reconcile.test.ts
+  resolve.test.ts
   webhooks.test.ts
   helpers/         Testcontainers global setup, truncate helper
 ```
