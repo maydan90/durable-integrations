@@ -45,6 +45,13 @@ create table if not exists provider_operations (
   updated_at       timestamptz not null
 );
 
+--    A person resolving a stuck operation (OperationStore.resolve) leaves an
+--    audit trail on the row: who, when, and what they checked. Added after the
+--    first release, like response_status above.
+alter table provider_operations add column if not exists resolved_by text;
+alter table provider_operations add column if not exists resolved_at timestamptz;
+alter table provider_operations add column if not exists resolution_note text;
+
 create index if not exists provider_operations_claimable
   on provider_operations (next_attempt_at)
   where state in ('pending', 'unknown', 'in_flight');

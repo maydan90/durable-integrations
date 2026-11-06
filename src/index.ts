@@ -9,8 +9,8 @@ export {
   requestDigest,
 } from "./idempotency.js";
 export type { IdempotentResult, IdempotentHttpResult, HttpResponse, IdempotencyOptions } from "./idempotency.js";
-export { OperationStore, StaleLeaseError } from "./operations.js";
-export type { Operation, OperationState, OperationsOptions, OperationStats } from "./operations.js";
+export { OperationStore, StaleLeaseError, NotStuckError } from "./operations.js";
+export type { Operation, OperationState, OperationsOptions, OperationStats, Resolution, ResolveInput } from "./operations.js";
 export { runWorker } from "./worker.js";
 export type { WorkerOptions, WorkerHandle } from "./worker.js";
 export { LostAnswerError, ScriptedProvider } from "./provider.js";

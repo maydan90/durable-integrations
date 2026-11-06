@@ -16,8 +16,8 @@ import { LostAnswerError, type Provider } from "./provider.js";
  *               success without writing again. If it did not, we resend with
  *               the same request_id.
  *   stuck    -> attempts exhausted while still unknown. Nothing is guessed; a
- *               human (or a reconciliation job) resolves it from the provider's
- *               records.
+ *               reconciliation job resolves it from the provider's records, or
+ *               a person does with resolve(), after checking the provider.
  *
  * Two rules that keep this honest:
  *   1. A refusal is only "nothing changed" when no earlier attempt could have
@@ -48,13 +48,43 @@ export interface Operation<P = unknown, R = unknown> {
    * expired. The next attempt must look before it writes.
    */
   recovering: boolean;
+  /** Set when a person resolved a stuck operation with resolve(). */
+  resolution: Resolution | null;
 }
+
+/** The audit trail resolve() leaves on the row. */
+export interface Resolution {
+  by: string;
+  at: Date;
+  note: string;
+}
+
+/**
+ * What a person found when they checked the provider for a stuck operation.
+ *   applied      the write is there; record success with the provider's result
+ *   not_applied  the write is not there; record it as refused (nothing changed)
+ * Both need who decided and what they checked, in words the next person can follow.
+ */
+export type ResolveInput<R = unknown> =
+  | { outcome: "applied"; result: R; by: string; note: string }
+  | { outcome: "not_applied"; by: string; note: string };
 
 export interface OperationsOptions {
   clock: Clock;
   leaseMs?: number;
   maxAttempts?: number;
   backoff?: { baseMs: number; maxMs: number; random?: () => number };
+}
+
+/** resolve() was called on a row that is not stuck (any more). `state` is what it is now. */
+export class NotStuckError extends Error {
+  readonly code = "not_stuck";
+  constructor(
+    id: string,
+    readonly state: OperationState | null,
+  ) {
+    super(state ? `Operation ${id} is ${state}, not stuck; nothing was changed` : `Operation ${id} does not exist`);
+  }
 }
 
 export class StaleLeaseError extends Error {
@@ -77,6 +107,9 @@ interface Row {
   next_attempt_at: Date;
   result: unknown;
   last_error: string | null;
+  resolved_by: string | null;
+  resolved_at: Date | null;
+  resolution_note: string | null;
   prev_state?: OperationState;
 }
 
@@ -95,11 +128,13 @@ function toOperation<P, R>(r: Row): Operation<P, R> {
     result: r.result as R | null,
     lastError: r.last_error,
     recovering: r.prev_state ? r.prev_state !== "pending" : r.attempts > 0,
+    resolution:
+      r.resolved_by && r.resolved_at ? { by: r.resolved_by, at: r.resolved_at, note: r.resolution_note ?? "" } : null,
   };
 }
 
 const COLUMNS =
-  "id, kind, request_id, payload, state, attempts, max_attempts, lease_owner, lease_until, next_attempt_at, result, last_error";
+  "id, kind, request_id, payload, state, attempts, max_attempts, lease_owner, lease_until, next_attempt_at, result, last_error, resolved_by, resolved_at, resolution_note";
 
 /**
  * "A worker could claim this row now", with $1 as the current time. claim(),
@@ -281,6 +316,40 @@ export class OperationStore {
   async stuck(): Promise<Operation[]> {
     const res = await this.pool.query<Row>(`select ${COLUMNS} from provider_operations where state = 'stuck' order by updated_at`);
     return res.rows.map((r) => toOperation(r));
+  }
+
+  /**
+   * A person resolves a stuck operation after checking the provider (its
+   * dashboard, a support ticket, a settlement file). Only a stuck row can be
+   * resolved: pending, in_flight and unknown rows belong to the workers, and a
+   * finished row has its answer. The update is a compare-and-set on
+   * state = 'stuck', so if the nightly reconciliation healed the row a moment
+   * earlier, this changes nothing and throws NotStuckError with the state it
+   * found. The row keeps who decided, when, and the note.
+   *
+   * It never resends. If the write is not there and still needs to happen,
+   * that is a new operation with a new request id, enqueued on purpose.
+   */
+  async resolve<R = unknown>(id: string, input: ResolveInput<R>): Promise<Operation<unknown, R>> {
+    const by = input.by.trim();
+    const note = input.note.trim();
+    if (!by) throw new RangeError("resolve: `by` is required");
+    if (!note) throw new RangeError("resolve: `note` is required: say what you checked");
+
+    const state: OperationState = input.outcome === "applied" ? "succeeded" : "refused";
+    const result = input.outcome === "applied" ? input.result : { refusal: { code: "not_applied", message: note } };
+
+    const res = await this.pool.query<Row>(
+      `update provider_operations
+          set state = $2, result = $3, resolved_by = $4, resolved_at = $5, resolution_note = $6, updated_at = $5
+        where id = $1 and state = 'stuck'
+       returning ${COLUMNS}`,
+      [id, state, JSON.stringify(result), by, this.opts.clock.now(), note],
+    );
+    if (res.rows[0]) return toOperation<unknown, R>(res.rows[0]);
+
+    const now = await this.pool.query<{ state: OperationState }>(`select state from provider_operations where id = $1`, [id]);
+    throw new NotStuckError(id, now.rows[0]?.state ?? null);
   }
 
   /**
